@@ -10,6 +10,8 @@ const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
 
 const TRACE_POINT_LIMIT = 22;
 const MIN_HIGHLIGHT_SIZE = 28;
+const VERTICAL_DEADZONE_FRACTION = 0.34;
+const VERTICAL_FOLLOW_EASE_MS = 520;
 
 interface Point {
   x: number;
@@ -32,6 +34,12 @@ function interpolateBox(a: BBoxFrame, b: BBoxFrame, amount: number): BBoxFrame {
     w_norm: mix(a.w_norm, b.w_norm, amount),
     h_norm: mix(a.h_norm, b.h_norm, amount),
   };
+}
+
+function easeObjectPosition(current: number, target: number, elapsedMs: number) {
+  if (Math.abs(target - current) < 0.0005) return target;
+  const amount = 1 - Math.exp(-Math.max(0, elapsedMs) / VERTICAL_FOLLOW_EASE_MS);
+  return mix(current, target, amount);
 }
 
 function getBoxAtProgress(bboxes: BBoxFrame[], progress: number) {
@@ -60,7 +68,7 @@ function getBoxAtProgress(bboxes: BBoxFrame[], progress: number) {
   return interpolateBox(lower, upper, amount);
 }
 
-function getRenderedBox(video: HTMLVideoElement, bbox: BBoxFrame) {
+function getRenderedBox(video: HTMLVideoElement, bbox: BBoxFrame, objectY: number) {
   const vw = video.videoWidth;
   const vh = video.videoHeight;
   const cw = video.clientWidth;
@@ -74,16 +82,30 @@ function getRenderedBox(video: HTMLVideoElement, bbox: BBoxFrame) {
   const overflowY = Math.max(0, renderedHeight - ch);
   const centerXNorm = bbox.x_norm + bbox.w_norm / 2;
   const centerYNorm = bbox.y_norm + bbox.h_norm / 2;
+  const centerY = centerYNorm * renderedHeight;
   const objectX = overflowX > 0 ? clamp01((centerXNorm * renderedWidth - cw / 2) / overflowX) : 0.5;
-  const objectY = overflowY > 0 ? clamp01((centerYNorm * renderedHeight - ch / 2) / overflowY) : 0.5;
+  const currentObjectY = overflowY > 0 ? clamp01(objectY) : 0.5;
+  let targetObjectY = currentObjectY;
+
+  if (overflowY > 0) {
+    const cyAtCurrentY = centerY - overflowY * currentObjectY;
+    const deadzoneHalfHeight = (ch * VERTICAL_DEADZONE_FRACTION) / 2;
+    const deadzoneTop = ch / 2 - deadzoneHalfHeight;
+    const deadzoneBottom = ch / 2 + deadzoneHalfHeight;
+
+    if (cyAtCurrentY < deadzoneTop) {
+      targetObjectY = clamp01((centerY - deadzoneTop) / overflowY);
+    } else if (cyAtCurrentY > deadzoneBottom) {
+      targetObjectY = clamp01((centerY - deadzoneBottom) / overflowY);
+    }
+  }
+
   const left = -overflowX * objectX;
-  const top = -overflowY * objectY;
+  const top = -overflowY * currentObjectY;
   const cx = left + centerXNorm * renderedWidth;
   const cy = top + centerYNorm * renderedHeight;
   const width = Math.max(MIN_HIGHLIGHT_SIZE, Math.abs(bbox.w_norm) * renderedWidth);
   const height = Math.max(MIN_HIGHLIGHT_SIZE, Math.abs(bbox.h_norm) * renderedHeight);
-
-  video.style.objectPosition = `${(objectX * 100).toFixed(2)}% ${(objectY * 100).toFixed(2)}%`;
 
   return {
     x: cx - width / 2,
@@ -94,6 +116,9 @@ function getRenderedBox(video: HTMLVideoElement, bbox: BBoxFrame) {
     cy,
     viewWidth: cw,
     viewHeight: ch,
+    objectX,
+    objectY: currentObjectY,
+    targetObjectY,
   };
 }
 
@@ -110,7 +135,6 @@ export function FeedCard({ snippet, isActive, preload, hasNext, onAdvance }: Fee
   const overlayRef = useRef<SVGSVGElement>(null);
   const traceGlowRef = useRef<SVGPolylineElement>(null);
   const traceRef = useRef<SVGPolylineElement>(null);
-  const highlightRef = useRef<SVGRectElement>(null);
   const {
     session,
     status,
@@ -153,9 +177,8 @@ export function FeedCard({ snippet, isActive, preload, hasNext, onAdvance }: Fee
     const overlay = overlayRef.current;
     const traceGlow = traceGlowRef.current;
     const trace = traceRef.current;
-    const highlight = highlightRef.current;
 
-    if (!isActive || bboxes.length === 0 || !overlay || !traceGlow || !trace || !highlight) {
+    if (!isActive || bboxes.length === 0 || !overlay || !traceGlow || !trace) {
       video.style.objectPosition = "";
       if (overlay) overlay.style.opacity = "0";
       return;
@@ -163,21 +186,28 @@ export function FeedCard({ snippet, isActive, preload, hasNext, onAdvance }: Fee
 
     let raf = 0;
     let points: Point[] = [];
+    let verticalObjectY = 0.5;
+    let lastTimestamp = 0;
 
-    const tick = () => {
+    const tick = (timestamp: number) => {
+      const elapsedMs = lastTimestamp > 0 ? timestamp - lastTimestamp : 16.7;
+      lastTimestamp = timestamp;
       const dur = video.duration;
       if (Number.isFinite(dur) && dur > 0) {
         const t = Math.min(Math.max(video.currentTime, 0), dur);
         const bbox = getBoxAtProgress(bboxes, t / dur);
-        const rendered = bbox ? getRenderedBox(video, bbox) : null;
-        if (rendered) {
+        const targetRendered = bbox ? getRenderedBox(video, bbox, verticalObjectY) : null;
+        if (bbox && targetRendered) {
+          verticalObjectY = easeObjectPosition(verticalObjectY, targetRendered.targetObjectY, elapsedMs);
+          const rendered = getRenderedBox(video, bbox, verticalObjectY);
+          if (!rendered) {
+            raf = requestAnimationFrame(tick);
+            return;
+          }
+          video.style.objectPosition = `${(rendered.objectX * 100).toFixed(2)}% ${(rendered.objectY * 100).toFixed(2)}%`;
+
           overlay.setAttribute("viewBox", `0 0 ${rendered.viewWidth} ${rendered.viewHeight}`);
           overlay.style.opacity = "1";
-
-          highlight.setAttribute("x", rendered.x.toFixed(2));
-          highlight.setAttribute("y", rendered.y.toFixed(2));
-          highlight.setAttribute("width", rendered.width.toFixed(2));
-          highlight.setAttribute("height", rendered.height.toFixed(2));
 
           const lastPoint = points[points.length - 1];
           if (!lastPoint || Math.hypot(lastPoint.x - rendered.cx, lastPoint.y - rendered.cy) > 2) {
@@ -223,7 +253,7 @@ export function FeedCard({ snippet, isActive, preload, hasNext, onAdvance }: Fee
           loop
           preload={preload ? "auto" : "metadata"}
           className="absolute inset-0 w-full h-full object-cover"
-          style={{ transition: "object-position 80ms linear" }}
+          style={{ willChange: "object-position" }}
         />
         {hasBboxes && (
           <svg
@@ -235,26 +265,18 @@ export function FeedCard({ snippet, isActive, preload, hasNext, onAdvance }: Fee
             <polyline
               ref={traceGlowRef}
               fill="none"
-              stroke="rgba(255,255,255,0.32)"
+              stroke="rgba(255,255,255,0.14)"
               strokeLinecap="round"
               strokeLinejoin="round"
-              strokeWidth="12"
+              strokeWidth="6"
             />
             <polyline
               ref={traceRef}
               fill="none"
-              stroke="rgba(255,255,255,0.92)"
+              stroke="rgba(255,255,255,0.55)"
               strokeLinecap="round"
               strokeLinejoin="round"
-              strokeWidth="3"
-            />
-            <rect
-              ref={highlightRef}
-              fill="none"
-              rx="10"
-              stroke="white"
-              strokeWidth="3"
-              vectorEffect="non-scaling-stroke"
+              strokeWidth="2"
             />
           </svg>
         )}
